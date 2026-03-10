@@ -1,0 +1,11 @@
+[Unit]
+Description=Paranoid iptables firewall
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fw.parano.min.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

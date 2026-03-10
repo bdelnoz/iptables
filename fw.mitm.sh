@@ -1,0 +1,694 @@
+#!/bin/bash
+# Auteur : Bruno DELNOZ
+# Email : bruno.delnoz@protonmail.com
+# Nom du script : fw.sh
+# Target usage : Firewall strict avec logging des paquets bloqués (SystemD)
+# Version : v13.3 – Date : 2026-03-05
+# Changelog :
+# - v13.3 (2026-03-05) : Fix Tailscale OUTPUT — ajout UDP sport 41641 (Tailscale émet depuis ce port) + UDP dport 3478 (STUN)
+# - v13.2 (2026-03-05) : Ajout règles Tailscale (INPUT/OUTPUT tailscale0 + FORWARD tailscale0<->wlan2 + NAT 100.64.0.0/10->wlan2)
+#                        Autorisation UDP 41641 (port Tailscale) en INPUT/OUTPUT
+#                        MASQUERADE source 100.64.0.0/10 vers wlan2 pour accès remote cam TAPO depuis iPhone 4G
+# - v13.1 (2026-02-22) : Ajout support hotspot WiFi MITM sur wlan2 (192.168.54.0/24) (DHCP + FORWARD + NAT + dnsmasq)
+# - v13.0 (2025-01-27) : Ajout support hotspot WiFi MITM sur wlan1 (DHCP + FORWARD)
+#   Autorisation trafic DHCP sur wlan1 (INPUT/OUTPUT ports 67:68)
+#   Autorisation FORWARD bidirectionnel wlan0 <-> wlan1 (ESTABLISHED/RELATED)
+#   Règles FORWARD explicites pour eth0, eth1, ET wlan1 vers wlan0
+#   Support complet pour le script MITM v2.5 avec hotspot WiFi
+# - v12.0 (2025-10-08) : Correction technique - Politiques NAT ne peuvent pas être DROP (limitation kernel), uniquement table filter
+# - v11.0 (2025-10-08) : Ajout politiques DROP pour table NAT (sécurité maximale)
+# - v10.0 (2025-10-08) : Version PICO BELLO - Nettoyage complet NAT, correction ICMP, meilleure lisibilité, ajout DHCP INPUT
+# - v9.5 (2025-10-01) : Correction compatibilité : remplacement conntrack par state, suppression nettoyages parasites
+# - v9.4 (2025-10-01) : Correction DNS - Commenté règles DROP redondantes qui cassaient les autorisations, suppression ligne NTP cassée
+# - v9.3 (2025-09-22) : Correction règle DNS INPUT pour autoriser les réponses depuis n'importe quel serveur DNS
+# Prérequis : iptables, jq, curl, dig, systemd
+
+set -e
+
+export TERM=xterm
+################################################################################
+# DEFAULT CONFIGURATION VARIABLES
+################################################################################
+# Network Interfaces
+LAN_IF="eth1"                        # Ethernet interface for SOURCESVR device
+WAN_IF="wlan0"                       # Interface connected to Internet
+WIFI_IF="wlan1"                      # WiFi interface for hotspot MITM
+WIFI2_IF="wlan2"                     # WiFi interface for hotspot MITM 2.4GHz
+
+# LAN Configuration
+LAN_IP="192.168.50.1"                # IP address for LAN gateway (Ethernet)
+LAN_NETMASK="24"                     # Netmask for LAN network
+LAN_DHCP_START="192.168.50.10"     # DHCP pool start address (Ethernet)
+LAN_DHCP_END="192.168.50.50"       # DHCP pool end address (Ethernet)
+DHCP_LEASE_TIME="12h"                # DHCP lease duration
+
+DNS1_IP="1.1.1.1"
+DNS2_IP="1.0.0.1"
+
+# WiFi Hotspot Configuration
+WIFI_ENABLED="true"                  # WiFi hotspot ENABLED by default
+WIFI_IP="192.168.51.1"               # IP address for WiFi gateway
+WIFI_NETMASK="24"                    # Netmask for WiFi network
+WIFI_DHCP_START="192.168.51.10"      # DHCP pool start for WiFi
+WIFI_DHCP_END="192.168.51.50"        # DHCP pool end for WiFi
+
+# WiFi Hotspot 2.4GHz (wlan2) Configuration
+WIFI2_ENABLED="true"                 # WiFi hotspot 2 ENABLED by default
+WIFI2_IP="192.168.54.1"              # IP address for WiFi2 gateway
+WIFI2_NETMASK="24"                   # Netmask for WiFi2 network
+WIFI2_DHCP_START="192.168.54.10"     # DHCP pool start for WiFi2
+WIFI2_DHCP_END="192.168.54.50"       # DHCP pool end for WiFi2
+
+
+################################################################################
+# PATHS AND FILES
+################################################################################
+SCRIPT_NAME=$(basename "$0")
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+VERSION="v3.0"
+
+
+# Configuration des logs
+LOG_DIR="/var/log/firewall/"
+LOG_FILE="/var/log/firewall/iptables-fw.log"
+
+# Créer le répertoire et le fichier de log si nécessaire
+if [ ! -d "$LOG_DIR" ]; then
+  mkdir -p "$LOG_DIR" || { echo "⚠️ Erreur lors de la création de $LOG_DIR"; exit 1; }
+  chown nox:nox "$LOG_DIR" || { echo "⚠️ Erreur lors du chown de $LOG_DIR"; exit 1; }
+fi
+if [ ! -f "$LOG_FILE" ]; then
+  touch "$LOG_FILE" || { echo "⚠️ Erreur lors de la création de $LOG_FILE"; exit 1; }
+  chown nox:nox "$LOG_FILE" || { echo "⚠️ Erreur lors du chown de $LOG_FILE"; exit 1; }
+fi
+
+# Fonction pour logger dans le fichier dédié
+log_to_file() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+log_to_file "=== Début de l'exécution de fw.sh ==="
+
+# Désactiver IPv6
+echo "🚫 Désactivation IPv6..."
+sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>>"$LOG_FILE" || log_to_file "Erreur lors de la désactivation d'IPv6 (all)"
+sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>>"$LOG_FILE" || log_to_file "Erreur lors de la désactivation d'IPv6 (default)"
+echo "✅ IPv6 désactivé"
+log_to_file "IPv6 désactivé."
+
+# Test de connectivité avec fallback pour systemd
+INTERNET_OK=false
+GITHUB_OK=false
+echo "🔍 Test de connectivité..."
+log_to_file "Test de connectivité..."
+if ping -c 1 -W 3 1.1.1.1 &> /dev/null; then
+  INTERNET_OK=true
+  echo "✅ Connectivité internet : OK"
+  log_to_file "Connectivité internet : OK"
+else
+  echo "⚠️ Pas de connectivité internet - Mode fallback activé"
+  log_to_file "AVERTISSEMENT : Pas de connectivité internet - Mode fallback activé"
+fi
+if $INTERNET_OK && curl -s --connect-timeout 5 --max-time 10 https://api.github.com/meta &> /dev/null; then
+  GITHUB_OK=true
+  echo "✅ Connectivité GitHub : OK"
+  log_to_file "Connectivité GitHub : OK"
+else
+  echo "⚠️ GitHub inaccessible - Utilisation IP statiques"
+  log_to_file "AVERTISSEMENT : GitHub inaccessible - Utilisation IP statiques"
+fi
+
+# Fonction pour récupérer les plages IPv4 GitHub SSH avec fallback
+get_github_ssh_ips() {
+  if $GITHUB_OK; then
+    ips=$(curl -s --max-time 10 https://api.github.com/meta | jq -r '.git[]' 2>>"$LOG_FILE" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+' | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)
+    if [ -n "$ips" ] && [ "$ips" != " " ]; then
+      log_to_file "IP GitHub récupérées dynamiquement: $ips"
+      echo "$ips"
+      return
+    fi
+  fi
+  # Fallback avec IP statiques connues de GitHub (mise à jour 2025)
+  fallback_ips="140.82.112.0/20 143.55.64.0/20 185.199.108.0/22 192.30.252.0/22"
+  log_to_file "Utilisation des IP GitHub en fallback: $fallback_ips"
+  echo "$fallback_ips"
+}
+
+GITHUB_SSH_IPS=($(get_github_ssh_ips))
+log_to_file "IP GitHub SSH récupérées: ${GITHUB_SSH_IPS[*]}"
+echo "🔍 Récupération des IP GitHub SSH..."
+echo "✅ IP GitHub SSH récupérées (${#GITHUB_SSH_IPS[@]} ranges)"
+
+# Vérification robuste des IP GitHub
+if [ ${#GITHUB_SSH_IPS[@]} -eq 0 ]; then
+  echo "⚠️ Aucune IP GitHub valide trouvée, SSH non configuré"
+  log_to_file "Erreur : Aucune IP GitHub valide, SSH non configuré"
+fi
+
+# NTP : RÉSOLUTION AVANT LES RÈGLES IPTABLES
+echo "🕒 Résolution des serveurs NTP..."
+log_to_file "Résolution NTP avant application des règles..."
+if $INTERNET_OK; then
+  NTP_IPS=$(dig +short +timeout=3 +tries=1 ntp.ubuntu.com 2>>"$LOG_FILE" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -3 | tr '\n' ' ' || true)
+fi
+if [ -z "$NTP_IPS" ] || [ "$NTP_IPS" = " " ]; then
+  # Fallback avec IP statiques des serveurs NTP Ubuntu
+  NTP_IPS="91.189.89.198 91.189.89.199 185.125.190.36"
+  echo "⚠️ Utilisation des IP NTP en fallback: $NTP_IPS"
+  log_to_file "Utilisation des IP NTP en fallback: $NTP_IPS"
+else
+  echo "✅ IP NTP résolues: $NTP_IPS"
+  log_to_file "IP NTP résolues: $NTP_IPS"
+fi
+
+if [ -z "$NTP_IPS" ]; then
+  echo "⚠️ Aucune IP NTP valide trouvée, NTP non configuré"
+  log_to_file "Erreur : Aucune IP NTP valide, NTP non configuré"
+fi
+
+echo ""
+echo "🧹 Nettoyage COMPLET de toutes les règles iptables..."
+
+# Vider TOUTES les tables (filter, nat, mangle)
+sudo iptables -t filter -F 2>>"$LOG_FILE" || log_to_file "Erreur lors du vidage table filter"
+sudo iptables -t filter -X 2>>"$LOG_FILE" || log_to_file "Erreur lors suppression chaînes filter"
+sudo iptables -t filter -Z 2>>"$LOG_FILE" || log_to_file "Erreur lors reset compteurs filter"
+
+sudo iptables -t nat -F 2>>"$LOG_FILE" || log_to_file "Erreur lors du vidage table nat"
+sudo iptables -t nat -X 2>>"$LOG_FILE" || log_to_file "Erreur lors suppression chaînes nat"
+sudo iptables -t nat -Z 2>>"$LOG_FILE" || log_to_file "Erreur lors reset compteurs nat"
+
+sudo iptables -t mangle -F 2>>"$LOG_FILE" || log_to_file "Erreur lors du vidage table mangle"
+sudo iptables -t mangle -X 2>>"$LOG_FILE" || log_to_file "Erreur lors suppression chaînes mangle"
+sudo iptables -t mangle -Z 2>>"$LOG_FILE" || log_to_file "Erreur lors reset compteurs mangle"
+
+sudo iptables -t INPUT -F 2>>"$LOG_FILE" || log_to_file "Erreur lors du vidage table INPUT"
+sudo iptables -t INPUT -X 2>>"$LOG_FILE" || log_to_file "Erreur lors suppression chaînes INPUT"
+sudo iptables -t INPUT -Z 2>>"$LOG_FILE" || log_to_file "Erreur lors reset compteurs INPUT"
+
+sudo iptables -t OUTPUT -F 2>>"$LOG_FILE" || log_to_file "Erreur lors du vidage table OUTPUT"
+sudo iptables -t OUTPUT -X 2>>"$LOG_FILE" || log_to_file "Erreur lors suppression chaînes OUTPUT"
+sudo iptables -t OUTPUT -Z 2>>"$LOG_FILE" || log_to_file "Erreur lors reset compteurs OUTPUT"
+
+sudo iptables -t FORWARD -F 2>>"$LOG_FILE" || log_to_file "Erreur lors du vidage table FORWARD"
+sudo iptables -t FORWARD -X 2>>"$LOG_FILE" || log_to_file "Erreur lors suppression chaînes FORWARD"
+sudo iptables -t FORWARD -Z 2>>"$LOG_FILE" || log_to_file "Erreur lors reset compteurs FORWARD"
+
+echo "✅ Toutes les tables iptables vidées (filter, nat, mangle, INPUT, OUTPUT, FORWARD)"
+log_to_file "Toutes les tables iptables vidées (filter, nat, mangle)."
+
+# Politique par défaut : tout bloquer (table filter)
+echo "🔒 Application des politiques par défaut (DROP)..."
+sudo iptables -P INPUT DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors de la définition de la politique INPUT DROP"
+sudo iptables -P OUTPUT DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors de la définition de la politique OUTPUT DROP"
+sudo iptables -P FORWARD DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors de la définition de la politique FORWARD DROP"
+
+# ============================================================
+# RÈGLES MITM WIFI HOTSPOT (WLAN1)
+# ============================================================
+echo " ↳ Configuration du hotspot WiFi MITM (wlan1)"
+
+# Autoriser le trafic DHCP sur wlan1 (nécessaire pour le hotspot)
+sudo iptables -A INPUT -i wlan1 -p udp --dport 67:68 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur DHCP INPUT wlan1"
+sudo iptables -A OUTPUT -o wlan1 -p udp --sport 67:68 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur DHCP OUTPUT wlan1"
+
+# Autoriser les retours de connexions EXISTANTES (WAN <-> LAN)
+sudo iptables -A FORWARD -i wlan0 -o eth0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i wlan0 -o eth1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# Autoriser les retours de connexions wlan0 <-> wlan1 (WiFi hotspot)
+sudo iptables -A FORWARD -i wlan0 -o wlan1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+log_to_file "Trafic DHCP et FORWARD autorisé pour hotspot WiFi MITM (wlan1)."
+
+# ============================================================
+# RÈGLES MITM WIFI HOTSPOT (WLAN2) - 192.168.54.0/24
+# ============================================================
+echo " ↳ Configuration du hotspot WiFi MITM (wlan2)"
+
+# Autoriser le trafic DHCP sur wlan2 (nécessaire pour le hotspot)
+sudo iptables -A INPUT -i wlan2 -p udp --dport 67:68 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur DHCP INPUT wlan2"
+sudo iptables -A OUTPUT -o wlan2 -p udp --sport 67:68 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur DHCP OUTPUT wlan2"
+
+# Autoriser les retours de connexions wlan0 <-> wlan2 (WiFi hotspot)
+sudo iptables -A FORWARD -i wlan0 -o wlan2 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur FORWARD EST/REL wlan0->wlan2"
+sudo iptables -A FORWARD -i wlan2 -o wlan0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur FORWARD EST/REL wlan2->wlan0"
+
+log_to_file "Trafic DHCP et FORWARD autorisé pour hotspot WiFi MITM (wlan2)."
+
+# ----------------------------------------------------------------------------------------------------------------------------
+
+# REGLES MITM-50 - DNS
+echo " ↳ Autorisation DNS pour range MITM-50"
+sudo iptables -A FORWARD -m iprange --src-range 192.168.50.10-192.168.50.100 -d 1.1.1.1 -p udp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -m iprange --src-range 192.168.50.10-192.168.50.100 -d 1.0.0.1 -p udp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -m iprange --src-range 192.168.50.10-192.168.50.100 -d 1.0.0.1 -p tcp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -m iprange --src-range 192.168.50.10-192.168.50.100 -d 1.1.1.1 -p tcp --dport 53 -j ACCEPT
+
+# DNS over TLS (port 853)
+sudo iptables -A FORWARD -m iprange --src-range 192.168.50.10-192.168.50.100 -d 1.0.0.1 -p tcp --dport 853 -j ACCEPT
+sudo iptables -A FORWARD -m iprange --src-range 192.168.50.10-192.168.50.100 -d 1.1.1.1 -p tcp --dport 853 -j ACCEPT
+
+# ============================================================
+# RÈGLES FORWARD POUR SUBNET MITM-51 (192.168.51.0/24)
+# ============================================================
+echo " ↳ Autorisation trafic WiFi MITM (192.168.51.0/24)"
+
+# DNS pour le subnet WiFi
+sudo iptables -A FORWARD -s 192.168.51.0/24 -d 1.1.1.1 -p udp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -s 192.168.51.0/24 -d 1.0.0.1 -p udp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -s 192.168.51.0/24 -d 1.1.1.1 -p tcp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -s 192.168.51.0/24 -d 1.0.0.1 -p tcp --dport 53 -j ACCEPT
+
+# NTP (port 123)
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -s 192.168.51.0/24 -p udp --dport 123 -j ACCEPT
+
+# HTTP (port 80)
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -s 192.168.51.0/24 -p tcp --dport 80 -j ACCEPT
+
+# HTTPS (port 443)
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -s 192.168.51.0/24 -p tcp --dport 443 -j ACCEPT
+
+# NAT pour le subnet WiFi
+# sudo iptables -t nat -A POSTROUTING -o wlan0 -s 192.168.51.0/24 -j MASQUERADE
+
+log_to_file "Trafic WiFi MITM (192.168.51.0/24) autorisé vers Internet."
+
+# ============================================================
+# RÈGLES FORWARD POUR SUBNET MITM-54 (192.168.54.0/24)
+# ============================================================
+echo " ↳ Autorisation trafic WiFi MITM (192.168.54.0/24)"
+
+# DNS pour le subnet WiFi2
+sudo iptables -A FORWARD -s 192.168.54.0/24 -d 1.1.1.1 -p udp --dport 53 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur DNS UDP 1.1.1.1 subnet 54"
+sudo iptables -A FORWARD -s 192.168.54.0/24 -d 1.0.0.1 -p udp --dport 53 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur DNS UDP 1.0.0.1 subnet 54"
+sudo iptables -A FORWARD -s 192.168.54.0/24 -d 1.1.1.1 -p tcp --dport 53 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur DNS TCP 1.1.1.1 subnet 54"
+sudo iptables -A FORWARD -s 192.168.54.0/24 -d 1.0.0.1 -p tcp --dport 53 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur DNS TCP 1.0.0.1 subnet 54"
+
+# NTP (port 123)
+sudo iptables -A FORWARD -i wlan2 -o wlan0 -s 192.168.54.0/24 -p udp --dport 123 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur NTP subnet 54"
+
+# HTTP (port 80)
+sudo iptables -A FORWARD -i wlan2 -o wlan0 -s 192.168.54.0/24 -p tcp --dport 80 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur HTTP subnet 54"
+
+# HTTPS (port 443)
+sudo iptables -A FORWARD -i wlan2 -o wlan0 -s 192.168.54.0/24 -p tcp --dport 443 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur HTTPS subnet 54"
+
+# NAT pour le subnet WiFi2
+# sudo iptables -t nat -A POSTROUTING -o wlan0 -s 192.168.54.0/24 -j MASQUERADE
+
+log_to_file "Trafic WiFi MITM (192.168.54.0/24) autorisé vers Internet."
+
+# ============================================================
+# RÈGLES TAILSCALE — ACCÈS REMOTE IPHONE 4G → CAM TAPO
+# ============================================================
+# Le trafic iPhone 4G arrive via l'interface tailscale0 (VPN Tailscale)
+# et doit être forwardé vers wlan2 (subnet 192.168.54.0/24 où est la cam TAPO)
+# Sans ces règles le FORWARD DROP par défaut bloque tout le trafic Tailscale→wlan2
+echo " ↳ Tailscale : FORWARD tailscale0 <-> wlan2 (accès remote TAPO)"
+
+# Trafic entrant depuis Tailscale (iPhone 4G) vers la cam TAPO sur wlan2
+sudo iptables -A FORWARD -i tailscale0 -o wlan2 -d 192.168.54.0/24 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur FORWARD tailscale0->wlan2"
+
+# Réponses de la cam TAPO vers Tailscale (retours de connexion)
+sudo iptables -A FORWARD -i wlan2 -o tailscale0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur FORWARD wlan2->tailscale0 ESTABLISHED"
+
+# NAT : réécrire la source Tailscale (100.x.x.x) en 192.168.54.1 (gateway wlan2)
+# Sans ce MASQUERADE la cam répond à une IP 100.x.x.x inconnue et ignore les paquets
+sudo iptables -t nat -A POSTROUTING -o wlan2 -s 100.64.0.0/10 -j MASQUERADE 2>>"$LOG_FILE" || log_to_file "Erreur NAT MASQUERADE tailscale->wlan2"
+
+log_to_file "Tailscale FORWARD tailscale0<->wlan2 configuré + NAT 100.64.0.0/10->wlan2."
+
+# ============================================================
+# AUTORISER DNSMASQ SUR WLAN1/ETH1 (LISTENING)
+# ============================================================
+echo " ↳ Autorisation dnsmasq (récepteur) sur wlan1 et eth1"
+
+# INPUT : accepter DNS depuis les clients
+sudo iptables -A INPUT -i eth1 -p udp --dport 53 -j ACCEPT
+sudo iptables -A INPUT -i eth1 -p tcp --dport 53 -j ACCEPT
+sudo iptables -A INPUT -i wlan1 -p udp --dport 53 -j ACCEPT
+sudo iptables -A INPUT -i wlan1 -p tcp --dport 53 -j ACCEPT
+
+# AJOUT WLAN2 : INPUT DNS depuis les clients
+sudo iptables -A INPUT -i wlan2 -p udp --dport 53 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur dnsmasq INPUT UDP wlan2"
+sudo iptables -A INPUT -i wlan2 -p tcp --dport 53 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur dnsmasq INPUT TCP wlan2"
+
+# OUTPUT : dnsmasq forward vers les vrais DNS
+sudo iptables -A OUTPUT -o wlan0 -p udp --dport 53 -j ACCEPT
+sudo iptables -A OUTPUT -o wlan0 -p tcp --dport 53 -j ACCEPT
+
+# FORWARD : autoriser clients → MITM DNS
+sudo iptables -A FORWARD -i eth1 -o eth1 -p udp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -i eth1 -o eth1 -p tcp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -i wlan1 -o wlan1 -p udp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -i wlan1 -o wlan1 -p tcp --dport 53 -j ACCEPT
+
+# AJOUT WLAN2 : FORWARD DNS local
+sudo iptables -A FORWARD -i wlan2 -o wlan2 -p udp --dport 53 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur dnsmasq FORWARD UDP wlan2"
+sudo iptables -A FORWARD -i wlan2 -o wlan2 -p tcp --dport 53 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur dnsmasq FORWARD TCP wlan2"
+
+log_to_file "dnsmasq INPUT/OUTPUT/FORWARD autorisé sur eth1 et wlan1."
+log_to_file "dnsmasq INPUT/OUTPUT/FORWARD autorisé sur wlan2."
+
+# Autoriser les flux SORTANTS MITM-50 -> Internet (depuis eth0, eth1, wlan1)
+echo " ↳ Autorisation flux MITM-50 vers Internet (eth0, eth1, wlan1)"
+
+# Port 11254
+sudo iptables -A FORWARD -i eth0 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p tcp --dport 11254 -j ACCEPT
+sudo iptables -A FORWARD -i eth1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p tcp --dport 11254 -j ACCEPT
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p tcp --dport 11254 -j ACCEPT
+
+# Ajouter au fw.sh AVANT les DROP finaux:
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -p tcp --dport 11254 -j ACCEPT
+sudo iptables -A FORWARD -i wlan0 -o wlan1 -p tcp --sport 11254 -m state --state ESTABLISHED -j ACCEPT
+
+# AJOUT WLAN2 (même logique que wlan1)
+sudo iptables -A FORWARD -i wlan2 -o wlan0 -p tcp --dport 11254 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur FORWARD wlan2->wlan0 dport 11254"
+sudo iptables -A FORWARD -i wlan0 -o wlan2 -p tcp --sport 11254 -m state --state ESTABLISHED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur FORWARD wlan0->wlan2 sport 11254 ESTABLISHED"
+
+# Re-ajouter les règles de base
+sudo iptables -A FORWARD -i wlan0 -o eth0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i wlan0 -o eth1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i wlan0 -o wlan1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# AJOUT WLAN2 : Re-ajouter les règles de base
+sudo iptables -A FORWARD -i wlan0 -o wlan2 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur base FORWARD EST/REL wlan0->wlan2"
+sudo iptables -A FORWARD -i wlan2 -o wlan0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur base FORWARD EST/REL wlan2->wlan0"
+
+# DNS pour TOUS les ranges
+sudo iptables -A FORWARD -m iprange --src-range 192.168.50.10-192.168.50.100 -d 1.1.1.1 -p udp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -m iprange --src-range 192.168.50.10-192.168.50.100 -d 1.0.0.1 -p udp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -m iprange --src-range 192.168.50.10-192.168.50.100 -d 1.1.1.1 -p tcp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -m iprange --src-range 192.168.50.10-192.168.50.100 -d 1.0.0.1 -p tcp --dport 53 -j ACCEPT
+
+# MITM-51 192.168.51.x (WiFi) - TOUT TRAFIC vers wlan0
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -j ACCEPT
+sudo iptables -A FORWARD -i wlan0 -o wlan1 -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# MITM-54 192.168.54.x (WiFi2) - TOUT TRAFIC vers wlan0
+sudo iptables -A FORWARD -i wlan2 -o wlan0 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur FORWARD ALL wlan2->wlan0"
+sudo iptables -A FORWARD -i wlan0 -o wlan2 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur FORWARD EST/REL wlan0->wlan2"
+
+# NTP (port 123)
+sudo iptables -A FORWARD -i eth0 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p udp --dport 123 -j ACCEPT
+sudo iptables -A FORWARD -i eth1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p udp --dport 123 -j ACCEPT
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p udp --dport 123 -j ACCEPT
+
+# HTTP (port 80)
+sudo iptables -A FORWARD -i eth0 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p tcp --dport 80 -j ACCEPT
+sudo iptables -A FORWARD -i eth1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p tcp --dport 80 -j ACCEPT
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p tcp --dport 80 -j ACCEPT
+
+# HTTPS (port 443)
+sudo iptables -A FORWARD -i eth0 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p tcp --dport 443 -j ACCEPT
+sudo iptables -A FORWARD -i eth1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p tcp --dport 443 -j ACCEPT
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -p tcp --dport 443 -j ACCEPT
+
+# NAT sortant pour TOUS les réseaux internes (Ethernet + WiFi)
+sudo iptables -t nat -F POSTROUTING
+sudo iptables -t nat -A POSTROUTING -o wlan0 -s 192.168.50.0/24 -j MASQUERADE  # Ethernet
+sudo iptables -t nat -A POSTROUTING -o wlan0 -s 192.168.51.0/24 -j MASQUERADE  # WiFi
+sudo iptables -t nat -A POSTROUTING -o wlan0 -s 192.168.54.0/24 -j MASQUERADE  # WiFi2 (wlan2)
+
+# Logging du trafic BLOQUÉ uniquement (1 seul LOG, juste avant DROP)
+echo " ↳ Configuration logging trafic bloqué MITM-50"
+sudo iptables -A FORWARD -i eth0 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -j LOG --log-prefix "MITM-50-BLOCKED: "
+sudo iptables -A FORWARD -i eth1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -j LOG --log-prefix "MITM-50-BLOCKED: "
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -j LOG --log-prefix "MITM-50-BLOCKED: "
+
+# Drop final MITM-50
+sudo iptables -A FORWARD -i eth0 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -j DROP
+sudo iptables -A FORWARD -i eth1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -j DROP
+sudo iptables -A FORWARD -i wlan1 -o wlan0 -m iprange --src-range 192.168.50.10-192.168.50.100 -j DROP
+
+log_to_file "Règles MITM-50 configurées pour eth0, eth1 et wlan1 (hotspot WiFi)."
+log_to_file "Règles MITM-54 ajoutées pour wlan2 (hotspot WiFi2 192.168.54.0/24)."
+
+# ----------------------------------------------------------------------------------------------------------------------------
+
+# Note : Les politiques des tables NAT/MANGLE ne peuvent pas être changées (limitation kernel)
+# Elles restent ACCEPT par défaut, mais on peut ajouter des règles DROP explicites si besoin
+
+echo "✅ Politique par défaut : DROP pour table filter (INPUT, OUTPUT, FORWARD)"
+log_to_file "Politique par défaut : DROP pour INPUT, OUTPUT, FORWARD (filter). NAT reste ACCEPT (limitation kernel)."
+
+echo ""
+echo "🛡️ Application des règles de sécurité..."
+
+# Autoriser le loopback
+echo " ↳ Loopback autorisé"
+sudo iptables -A INPUT -i lo -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation du loopback (INPUT)"
+sudo iptables -A OUTPUT -o lo -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation du loopback (OUTPUT)"
+log_to_file "Loopback autorisé."
+
+# Autoriser les connexions déjà établies ou liées
+echo " ↳ Connexions établies/liées autorisées"
+sudo iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation des connexions établies (INPUT)"
+sudo iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation des connexions établies (OUTPUT)"
+log_to_file "Connexions établies/liées autorisées."
+
+# ICMP : ping sortant limité à 1/s, réponses entrantes autorisées
+echo " ↳ ICMP : ping sortant limité (1/s), réponses entrantes autorisées"
+sudo iptables -A OUTPUT -p icmp --icmp-type echo-request -m limit --limit 1/s --limit-burst 5 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur ICMP OUTPUT"
+sudo iptables -A INPUT -p icmp --icmp-type echo-reply -m limit --limit 1/s --limit-burst 5 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur ICMP INPUT"
+# Autoriser les autres types ICMP nécessaires (ESTABLISHED/RELATED déjà autorisé au-dessus)
+sudo iptables -A INPUT -p icmp -m state --state ESTABLISHED,RELATED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur ICMP RELATED INPUT"
+# Bloquer le reste (destination-unreachable, time-exceeded, etc. non sollicités)
+sudo iptables -A INPUT -p icmp -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur DROP ICMP INPUT"
+sudo iptables -A OUTPUT -p icmp -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur DROP ICMP OUTPUT"
+log_to_file "ICMP : ping sortant limité (1/s), réponses entrantes autorisées."
+
+# DNS : Autoriser uniquement UDP vers les serveurs DNS configurés (OUTPUT)
+echo " ↳ DNS autorisé vers 5 serveurs configurés (OUTPUT)"
+for dns_ip in "1.1.1.1" "8.8.8.8" "8.8.4.4" "208.67.222.222" "208.67.220.220"; do
+  sudo iptables -A OUTPUT -p udp -d "$dns_ip" --dport 53 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation DNS pour $dns_ip (OUTPUT)"
+done
+
+# Autoriser les réponses DNS entrantes (UDP, port source 53, ESTABLISHED)
+echo " ↳ Réponses DNS entrantes autorisées (UDP port source 53, ESTABLISHED)"
+sudo iptables -A INPUT -p udp --sport 53 -m state --state ESTABLISHED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation des réponses DNS (INPUT)"
+log_to_file "DNS autorisé uniquement en UDP vers 5 serveurs configurés (avec réponses entrantes)."
+
+# DHCP
+echo " ↳ DHCP autorisé"
+sudo iptables -A OUTPUT -p udp --sport 67:68 --dport 67:68 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation DHCP OUTPUT"
+sudo iptables -A INPUT -p udp --sport 67:68 --dport 67:68 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation DHCP INPUT"
+log_to_file "DHCP autorisé."
+
+# HTTPS uniquement (pas de HTTP)
+echo " ↳ HTTPS autorisé (HTTP bloqué)"
+sudo iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation HTTPS OUTPUT"
+sudo iptables -A INPUT -p tcp --sport 443 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation HTTPS INPUT"
+log_to_file "HTTPS autorisé (INPUT et OUTPUT), HTTP bloqué."
+
+# HTTP uniquement pour l'IP 109.61.81.65
+echo " ↳ HTTP autorisé UNIQUEMENT pour l'IP 109.61.81.65 (port 80)"
+sudo iptables -A OUTPUT -p tcp -d 109.61.81.65 --dport 80 -m state --state NEW,ESTABLISHED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation HTTP pour 109.61.81.65 (OUTPUT)"
+sudo iptables -A INPUT -p tcp -s 109.61.81.65 --sport 80 -m state --state ESTABLISHED -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation HTTP pour 109.61.81.65 (INPUT)"
+
+# ============================================================
+# TAILSCALE — INPUT / OUTPUT casablanca ↔ réseau Tailscale
+# ============================================================
+# tailscaled tourne sur casablanca et doit pouvoir communiquer :
+# - sur l'interface tailscale0 (trafic VPN chiffré WireGuard)
+# - sur UDP 41641 (port de signalisation/direct peer Tailscale)
+# Sans ces règles OUTPUT DROP bloque tailscaled et INPUT DROP bloque les peers
+echo " ↳ Tailscale : INPUT/OUTPUT tailscale0 + UDP 41641"
+
+# Tout trafic INPUT depuis l'interface tailscale0 (trafic VPN déchiffré)
+sudo iptables -A INPUT -i tailscale0 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur INPUT tailscale0"
+
+# Tout trafic OUTPUT vers l'interface tailscale0
+sudo iptables -A OUTPUT -o tailscale0 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur OUTPUT tailscale0"
+
+# UDP 41641 en INPUT : permettre aux peers Tailscale de joindre casablanca directement
+sudo iptables -A INPUT -p udp --dport 41641 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur INPUT UDP 41641 Tailscale"
+
+# UDP 41641 en OUTPUT : casablanca peut contacter les peers et les serveurs DERP Tailscale
+sudo iptables -A OUTPUT -p udp --dport 41641 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur OUTPUT UDP 41641 Tailscale"
+
+# UDP sport 41641 en OUTPUT : Tailscale émet DEPUIS le port 41641 vers des destinations variables
+# Sans cette règle : IPTables-Blocked-OUT SPT=41641 DPT=xxxxx → connexion directe peer bloquée
+sudo iptables -A OUTPUT -p udp --sport 41641 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur OUTPUT UDP sport 41641 Tailscale"
+
+# UDP sport 41641 en INPUT : réponses aux paquets émis depuis le port 41641
+sudo iptables -A INPUT -p udp --dport 41641 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur INPUT UDP dport 41641 Tailscale"
+sudo iptables -A INPUT -p udp --sport 41641 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur INPUT UDP sport 41641 Tailscale"
+
+# UDP 3478 en OUTPUT : port STUN utilisé par Tailscale pour le NAT traversal
+# Sans cette règle : IPTables-Blocked-OUT DPT=3478 → Tailscale ne peut pas détecter le type de NAT
+sudo iptables -A OUTPUT -p udp --dport 3478 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur OUTPUT UDP 3478 STUN Tailscale"
+
+log_to_file "Tailscale INPUT/OUTPUT tailscale0 + UDP 41641 (sport+dport) + UDP 3478 STUN autorisés."
+log_to_file "HTTP autorisé UNIQUEMENT pour l'IP 109.61.81.65 (port 80)."
+
+# SSH uniquement vers IP GitHub (output seulement) - avec validation
+set +e
+echo " ↳ Configuration SSH vers GitHub..."
+ssh_rules_added=0
+for cidr in "${GITHUB_SSH_IPS[@]}"; do
+  if [[ "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+    if sudo iptables -A OUTPUT -p tcp -d "$cidr" --dport 22 -m state --state NEW,ESTABLISHED -j ACCEPT 2>>"$LOG_FILE"; then
+      ((ssh_rules_added++))
+    else
+      log_to_file "Erreur lors de l'autorisation SSH pour $cidr"
+      echo "⚠️ Erreur lors de l'ajout de la règle SSH pour $cidr"
+    fi
+  else
+    log_to_file "CIDR invalide ignoré (format): '$cidr'"
+  fi
+done
+
+
+sudo iptables -A INPUT -s 192.168.54.18 -p tcp --dport 22 -j ACCEPT
+sudo iptables -I OUTPUT -o wlan2 -d 192.168.54.0/24 -p tcp --dport 22 -j ACCEPT
+
+
+# Bloquer tout autre SSH
+sudo iptables -A OUTPUT -p tcp --dport 22 -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage SSH"
+set -e
+echo " ↳ SSH autorisé vers GitHub ($ssh_rules_added ranges)"
+log_to_file "SSH autorisé uniquement vers les IP GitHub ($ssh_rules_added ranges valides)."
+
+# NTP : avec fallback si résolution DNS échoue
+set +e
+echo " ↳ Configuration NTP..."
+ntp_rules_added=0
+for ip in $NTP_IPS; do
+  if [ -n "$ip" ] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    if sudo iptables -A OUTPUT -p udp -d "$ip" --dport 123 -j ACCEPT 2>>"$LOG_FILE"; then
+      ((ntp_rules_added++))
+    else
+      log_to_file "Erreur lors de l'autorisation NTP pour $ip"
+      echo "⚠️ Erreur lors de l'ajout de la règle NTP pour $ip"
+    fi
+  else
+    log_to_file "IP NTP invalide ignorée: $ip"
+    echo "⚠️ IP NTP invalide ignorée: $ip"
+  fi
+done
+set -e
+echo " ↳ NTP autorisé vers $ntp_rules_added serveurs"
+log_to_file "NTP autorisé vers $ntp_rules_added serveurs."
+echo ""
+
+echo "🚫 Application des règles de blocage..."
+
+# Bloquer le port 5228 (Google Talk/Android Push Notifications)
+echo " ↳ Port 5228 bloqué (IN/OUT)"
+sudo iptables -A INPUT -p tcp --dport 5228 -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage port 5228 (TCP INPUT)"
+sudo iptables -A INPUT -p udp --dport 5228 -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage port 5228 (UDP INPUT)"
+sudo iptables -A OUTPUT -p tcp --dport 5228 -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage port 5228 (TCP OUTPUT)"
+sudo iptables -A OUTPUT -p udp --dport 5228 -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage port 5228 (UDP OUTPUT)"
+log_to_file "Port 5228 bloqué en INPUT/OUTPUT (Google Talk/Android Push Notifications)."
+
+# Bloquer explicitement les nouvelles connexions entrantes non établies
+echo " ↳ Nouvelles connexions entrantes bloquées"
+sudo iptables -A INPUT -m state --state NEW -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage des nouvelles connexions (INPUT)"
+log_to_file "Nouveaux paquets entrants non établis bloqués."
+
+# Protéger contre les scans de ports (limiter les SYN entrants)
+echo " ↳ Protection anti-scan activée"
+sudo iptables -A INPUT -p tcp --syn -m limit --limit 1/s --limit-burst 5 -j ACCEPT 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'autorisation SYN (INPUT)"
+sudo iptables -A INPUT -p tcp --syn -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage SYN (INPUT)"
+log_to_file "Protection contre les scans de ports activée."
+
+# Bloquer les paquets invalides
+echo " ↳ Paquets invalides bloqués"
+sudo iptables -A INPUT -m state --state INVALID -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage des paquets invalides (INPUT)"
+sudo iptables -A OUTPUT -m state --state INVALID -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage des paquets invalides (OUTPUT)"
+sudo iptables -A FORWARD -m state --state INVALID -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage des paquets invalides (FORWARD)"
+log_to_file "Paquets invalides bloqués."
+echo ""
+
+echo "📊 Configuration du logging..."
+# Créer les chaînes de logging
+sudo iptables -N LOGGING_IN 2>>"$LOG_FILE" || log_to_file "Chaîne LOGGING_IN existe déjà"
+sudo iptables -N LOGGING_OUT 2>>"$LOG_FILE" || log_to_file "Chaîne LOGGING_OUT existe déjà"
+
+
+# Logging des paquets bloqués
+echo " ↳ Logging des paquets bloqués activé"
+sudo iptables -A LOGGING_IN -m limit --limit 5/min --limit-burst 5 -j LOG --log-prefix "IPTables-Blocked-IN: " --log-level 4 2>>"$LOG_FILE" || log_to_file "Erreur lors de la configuration du logging INPUT"
+sudo iptables -A LOGGING_IN -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage LOGGING_IN"
+sudo iptables -A LOGGING_OUT -m limit --limit 5/min --limit-burst 5 -j LOG --log-prefix "IPTables-Blocked-OUT: " --log-level 4 2>>"$LOG_FILE" || log_to_file "Erreur lors de la configuration du logging OUTPUT"
+sudo iptables -A LOGGING_OUT -j DROP 2>>"$LOG_FILE" || log_to_file "Erreur lors du blocage LOGGING_OUT"
+
+# Logging spécifique pour HTTPS (port 443)
+echo " ↳ Logging spécifique port 443 activé"
+sudo iptables -A INPUT -p tcp --sport 443 -m limit --limit 1/min --limit-burst 3 -j LOG --log-prefix "IPTables-Blocked-IN-443: " --log-level 4 2>>"$LOG_FILE" || log_to_file "Erreur lors du logging port 443 (INPUT)"
+sudo iptables -A OUTPUT -p tcp --dport 443 -m limit --limit 1/min --limit-burst 3 -j LOG --log-prefix "IPTables-Blocked-OUT-443: " --log-level 4 2>>"$LOG_FILE" || log_to_file "Erreur lors du logging port 443 (OUTPUT)"
+
+# Logging spécifique pour le port 5228
+echo " ↳ Logging spécifique port 5228 activé"
+sudo iptables -A INPUT -p tcp --dport 5228 -m limit --limit 1/min --limit-burst 3 -j LOG --log-prefix "IPTables-Blocked-IN-5228: " --log-level 4 2>>"$LOG_FILE" || log_to_file "Erreur lors du logging port 5228 (INPUT)"
+sudo iptables -A OUTPUT -p tcp --dport 5228 -m limit --limit 1/min --limit-burst 3 -j LOG --log-prefix "IPTables-Blocked-OUT-5228: " --log-level 4 2>>"$LOG_FILE" || log_to_file "Erreur lors du logging port 5228 (OUTPUT)"
+
+# Rediriger vers les chaînes de logging
+sudo iptables -A INPUT -j LOGGING_IN 2>>"$LOG_FILE" || log_to_file "Erreur lors de la redirection INPUT vers LOGGING_IN"
+sudo iptables -A OUTPUT -j LOGGING_OUT 2>>"$LOG_FILE" || log_to_file "Erreur lors de la redirection OUTPUT vers LOGGING_OUT"
+
+log_to_file "Logging configuré et actif."
+echo ""
+
+echo "💾 Sauvegarde et finalisation..."
+
+# Sauvegarde des règles (TOUTES LES TABLES)
+sudo iptables-save > /etc/iptables/rules.v4 2>>"$LOG_FILE" || log_to_file "Erreur lors de la sauvegarde des règles iptables"
+echo " ↳ Règles sauvegardées dans /etc/iptables/rules.v4"
+log_to_file "Règles sauvegardées dans /etc/iptables/rules.v4."
+
+# Journaliser les règles appliquées (compatible systemd)
+{
+  echo "=== Règles iptables appliquées ==="
+  sudo iptables -L -v -n 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'affichage des règles pour systemd"
+} | systemd-cat -t fw.sh 2>>"$LOG_FILE" || log_to_file "Erreur lors de l'envoi des règles à systemd-cat"
+
+# Afficher les règles en place sur le terminal
+echo ""
+echo "📋 Affichage des règles iptables appliquées..."
+echo "=============================================="
+if ! sudo iptables -L -v -n 2>>"$LOG_FILE"; then
+  echo "⚠️ Erreur lors de l'affichage des règles iptables"
+  log_to_file "Erreur lors de l'affichage des règles iptables"
+fi
+echo ""
+
+echo "🎉 Firewall appliqué avec succès! PICO BELLO! ✨"
+echo "📊 Résumé de la configuration:"
+echo " • Mode: $($INTERNET_OK && echo 'En ligne' || echo 'Fallback')"
+echo " • SSH: $ssh_rules_added ranges GitHub"
+echo " • NTP: $ntp_rules_added serveurs"
+echo " • DNS: Autorisé UNIQUEMENT vers 5 serveurs configurés"
+echo " • HTTPS: Autorisé (HTTP bloqué)"
+echo " • Port 5228: Bloqué et loggé"
+echo " • Paquets INVALID: Bloqués"
+echo " • Table NAT: Vidée (politiques ACCEPT par défaut kernel)"
+echo " • Hotspot WiFi MITM: wlan1 (DHCP + FORWARD autorisés)"
+echo " • Hotspot WiFi MITM: wlan2 (DHCP + FORWARD autorisés) (192.168.54.0/24)"
+echo " • Tailscale       : INPUT/OUTPUT tailscale0 + UDP 41641 (sport+dport) + UDP 3478 STUN + FORWARD tailscale0<->wlan2 + NAT 100.64.0.0/10"
+echo " • Logging: Actif (voir $LOG_FILE)"
+echo ""
+sleep 3
+log_to_file "=== Fin de l'exécution de fw.sh v13.0 avec support WiFi MITM ==="
+log_to_file "Résumé :"
+log_to_file "- Internet: $($INTERNET_OK && echo 'OK' || echo 'FALLBACK')"
+log_to_file "- GitHub: $($GITHUB_OK && echo 'OK' || echo 'FALLBACK')"
+log_to_file "- DNS: OUTPUT UNIQUEMENT vers 5 serveurs configurés"
+log_to_file "- SSH: Autorisé vers GitHub uniquement ($ssh_rules_added ranges)"
+log_to_file "- NTP: $ntp_rules_added serveurs ($($INTERNET_OK && echo 'dynamique' || echo 'statique'))"
+log_to_file "- HTTPS: Autorisé, HTTP bloqué"
+log_to_file "- Port 5228: Bloqué et loggé"
+log_to_file "- Paquets INVALID: Bloqués"
+log_to_file "- Tables nettoyées: filter, nat, mangle"
+log_to_file "- Module: state (compatibilité maximale)"
+log_to_file "- Hotspot WiFi MITM: wlan1 configuré avec DHCP et FORWARD"
+log_to_file "- Hotspot WiFi MITM: wlan2 configuré avec DHCP et FORWARD (192.168.54.0/24)"
+log_to_file "- Tailscale: INPUT/OUTPUT tailscale0 + UDP 41641 (sport+dport) + UDP 3478 STUN + FORWARD tailscale0<->wlan2 + NAT 100.64.0.0/10->wlan2"
+
+# Signal de fin pour systemd
+exit 0
