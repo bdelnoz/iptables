@@ -7,7 +7,7 @@ Before=sshd.service
 
 [Service]
 Type=oneshot
-ExecStart=/root/fw.sh
+ExecStart=/usr/local/bin/fw.sh
 RemainAfterExit=true
 TimeoutStartSec=45
 StandardOutput=journal
