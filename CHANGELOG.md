@@ -1,10 +1,9 @@
-
----
-
-### `CHANGELOG.md`
-
-```markdown
 # Changelog
+
+## v1.0.3 (2026-03-17)
+- Correction du chemin `ExecStart` dans `iptables-fw.service` (`/usr/local/bin/fw.sh`).
+- `install_fw.sh` met désormais à jour les fichiers installés si le contenu local change (au lieu de les ignorer s'ils existent déjà).
+- Passage à `systemctl restart` après synchronisation pour appliquer immédiatement les changements de service.
 
 ## v1.0.2 (2025-10-08)
 - Ajout de la vérification d'existence avant copie (pas de réécriture si déjà installé).

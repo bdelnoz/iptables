@@ -1,21 +1,87 @@
-# iptables
-# Installation du Firewall avec SystemD
+<!--
+Document : README.md (iptables firewall + service SystemD)
+Auteur : Bruno DELNOZ
+Email : bruno.delnoz@protonmail.com
+Version : v1.1.0
+Date : 2026-03-17 00:00
+-->
+# iptables - Installation du Firewall avec SystemD
 
-Ce script permet d'installer et de configurer un firewall strict avec un service SystemD pour gérer les règles de firewall.
+Ce dépôt fournit un pare-feu `iptables` strict et un service SystemD qui applique automatiquement les règles au démarrage.
 
-### Fichiers inclus
-1. **fw.sh** : Le script qui définit les règles de firewall avec `iptables`.
-2. **iptables-fw.service** : Le fichier de service SystemD pour gérer l'exécution du script `fw.sh` au démarrage.
-3. **install_fw.sh** : Le script d'installation qui copie les fichiers nécessaires, applique les permissions et configure le service.
+## Contenu du dépôt
 
-### Prérequis
-- Un système basé sur Linux avec `iptables` installé.
-- Un accès `sudo` pour installer et configurer le service.
-- Le service `SystemD` doit être activé sur la machine.
+1. `fw.sh` : script principal qui applique les règles firewall.
+2. `iptables-fw.service` : unité SystemD lancée au boot.
+3. `install_fw.sh` : script d'installation/mise à jour (copie, permissions, activation, redémarrage du service).
+4. `CHANGELOG.md` et `CHANGELOG_en.md` : historique des versions.
 
-### Installation
+## Prérequis
 
-1. Téléchargez tous les fichiers nécessaires dans un répertoire.
-2. Rendez le script `install_fw.sh` exécutable :
-   ```bash
-   chmod +x install_fw.sh
+- Linux avec `systemd`
+- `iptables`
+- `sudo` / privilèges root
+- Dépendances utilisées par `fw.sh` : `jq`, `curl`, `dig`
+
+## Correctif important (bug service)
+
+Le service SystemD est désormais aligné avec le chemin d'installation réel du script :
+
+- **Chemin exécuté par SystemD** : `/usr/local/bin/fw.sh`
+- **Chemin d'installation par `install_fw.sh`** : `/usr/local/bin/fw.sh`
+
+Cela évite l'erreur précédente liée à un décalage de chemin (`/root/fw.sh`).
+
+## Installation / mise à jour
+
+Depuis le dossier du dépôt :
+
+```bash
+chmod +x install_fw.sh
+sudo ./install_fw.sh
+```
+
+Le script :
+
+- synchronise `fw.sh` et `iptables-fw.service` si le contenu local a changé,
+- applique les permissions,
+- recharge SystemD,
+- active le service au démarrage,
+- redémarre le service immédiatement.
+
+## Vérifications après installation
+
+```bash
+systemctl status iptables-fw.service
+systemctl cat iptables-fw.service
+journalctl -u iptables-fw.service -n 100 --no-pager
+```
+
+Vérifier en particulier :
+
+- `ExecStart=/usr/local/bin/fw.sh`
+- état du service : `active (exited)`
+
+## Exécution manuelle (debug)
+
+Pour tester le script sans passer par SystemD :
+
+```bash
+sudo /usr/local/bin/fw.sh
+```
+
+## Fichiers installés
+
+- Script : `/usr/local/bin/fw.sh`
+- Service : `/etc/systemd/system/iptables-fw.service`
+- Logs firewall (selon `fw.sh`) : `/var/log/firewall/iptables-fw.log`
+
+## Notes
+
+- Le script firewall applique une politique restrictive ; valider l'accès distant avant déploiement sur une machine de production.
+- En cas de modification du service, toujours faire :
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart iptables-fw.service
+```
